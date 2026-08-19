@@ -24,21 +24,28 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long a test waits for the daemon to reach a state before calling it a failure. The refresh
-/// path debounces 120 ms and then re-reads the graph, so this is generous by two orders of
-/// magnitude on purpose: a flaky timeout is worse than a slow failure.
-const PATIENCE: Duration = Duration::from_secs(10);
+/// How long a test waits for the daemon to reach a state before calling it a failure.
+///
+/// The refresh path debounces 120 ms, which this used to be generous against by two orders of
+/// magnitude. It no longer is, and the reason matters: declaring a peer unreachable deliberately
+/// costs three consecutive failed probes on a two-second reconcile, so roughly six seconds pass
+/// before anything observable happens -- by design, so a Wi-Fi roam is not an outage. Ten seconds
+/// left an outage test finishing at 8.2 s, which is a flake waiting to happen. A flaky timeout is
+/// worse than a slow failure.
+const PATIENCE: Duration = Duration::from_secs(30);
 
 /// How long any single `nixaudioctl` call may take before the harness gives up on it. Well under
 /// `PATIENCE`, so a stuck call surfaces as a failed call rather than as a stalled poll loop.
 const CALL_PATIENCE: Duration = Duration::from_secs(5);
 
 pub struct World {
+    control_port: u16,
     directory: tempfile::TempDir,
     bus: Child,
     bus_address: String,
     daemon: Option<Child>,
     graph_path: PathBuf,
+    stderr_path: PathBuf,
     events_path: PathBuf,
     log_path: PathBuf,
     config_path: PathBuf,
@@ -46,6 +53,27 @@ pub struct World {
 }
 
 impl World {
+    /// Stage a graph, declare a device catalogue, and start a daemon with the fabric off. The
+    /// catalogue is what a host says it expects to have names for; a test needs one to say anything
+    /// about a device that is declared and not present.
+    pub fn local_with_catalogue(graph: Value, catalogue: Value) -> Self {
+        Self::new(graph, |config| {
+            config["peers"] = json!({});
+            config["catalogue"] = catalogue;
+        })
+        .started(true)
+    }
+
+    /// Stage a graph and start a daemon with NO peers but the control server LISTENING, so a test
+    /// can fetch the manifest this host publishes exactly as a peer would. Peerless on purpose:
+    /// what a host advertises is a property of the host, not of who is asking.
+    pub fn local_but_reachable(graph: Value) -> Self {
+        Self::new(graph, |config| {
+            config["peers"] = json!({});
+        })
+        .started(false)
+    }
+
     /// Stage a graph and start a daemon against it, with the fabric switched off. Most tests are
     /// about the local graph and want no peer traffic at all.
     pub fn local(graph: Value) -> Self {
@@ -63,12 +91,41 @@ impl World {
         .started(false)
     }
 
+    /// Stage a graph and start a daemon with the fabric live, talking to `peers`, but launching
+    /// something other than the healthy JackTrip stand-in. The command is the one interception
+    /// point that needs no production change, so a test can supply a worker that fails in a
+    /// specific way -- exits at once, refuses to bind -- and watch how the supervisor answers.
+    pub fn with_peers_running(graph: Value, peers: Value, jacktrip_fixture: &str) -> Self {
+        let command = fixtures_directory().join(jacktrip_fixture);
+        assert!(
+            command.is_file(),
+            "no such jacktrip fixture: {}",
+            command.display()
+        );
+        Self::new(graph, |config| {
+            config["peers"] = peers;
+            config["transport"]["command"] = json!([command.to_str().unwrap()]);
+        })
+        .started(false)
+    }
+
+    /// Start a daemon whose PipeWire refuses to answer from the very first read, as a host under
+    /// enough load that `pw-dump` loses its timeout before anything has ever succeeded.
+    pub fn local_starting_blind(graph: Value) -> Self {
+        let world = Self::new(graph, |config| {
+            config["peers"] = json!({});
+        });
+        std::fs::write(world.graph_path.with_extension("json.broken"), b"").unwrap();
+        world.started(true)
+    }
+
     fn new(graph: Value, customise: impl FnOnce(&mut Value)) -> Self {
         let directory = tempfile::tempdir().expect("temporary directory");
         let root = directory.path().to_path_buf();
         let fixtures = fixtures_directory();
 
         let graph_path = root.join("graph.json");
+        let stderr_path = root.join("daemon.stderr");
         let events_path = root.join("events");
         let log_path = root.join("calls.log");
         let config_path = root.join("config.json");
@@ -78,9 +135,10 @@ impl World {
         std::fs::write(&events_path, b"").unwrap();
         std::fs::write(&log_path, b"").unwrap();
 
+        let control_port = free_port();
         let mut config = json!({
             "node": "alpha",
-            "control": { "listen": "127.0.0.1", "port": free_port() },
+            "control": { "listen": "127.0.0.1", "port": control_port },
             "transport": { "command": [fixtures.join("jacktrip").to_str().unwrap()] },
             "peers": {},
             "catalogue": {},
@@ -91,11 +149,13 @@ impl World {
         let (bus, bus_address) = start_bus(&root);
 
         Self {
+            control_port,
             directory,
             bus,
             bus_address,
             daemon: None,
             graph_path,
+            stderr_path,
             events_path,
             log_path,
             config_path,
@@ -111,9 +171,17 @@ impl World {
     fn start_daemon(&mut self, offline: bool) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_nixaudiod"));
         self.apply_environment(&mut command, offline);
+        // Appended to a file rather than piped. A pipe nobody drains is a promise this harness
+        // cannot keep: every panic here offers the daemon's stderr, and a restart-based test
+        // needs the output from BEFORE the restart to still be there afterwards.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.stderr_path)
+            .expect("daemon stderr log");
         let child = command
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(log))
             .spawn()
             .expect("start nixaudiod");
         self.daemon = Some(child);
@@ -155,7 +223,64 @@ impl World {
         }
     }
 
-    /// Replace the graph the fake `pw-dump` reports, then wake the daemon.
+    /// Print raw text into the monitor stream, exactly as `pw-dump --monitor` prints a batch.
+    ///
+    /// `notify` sends a bare nudge, which the daemon takes at face value. This one lets a test
+    /// hand it a REAL batch and find out whether it decides to care.
+    pub fn inject(&self, batch: &str) {
+        use std::io::Write;
+        let mut events = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.events_path)
+            .unwrap();
+        writeln!(events, "{batch}").unwrap();
+    }
+
+    /// Poison the graph read WITHOUT nudging the daemon.
+    ///
+    /// The poison is invisible until something makes it run `pw-dump` again, which turns "did
+    /// this event wake the daemon?" into a question a test can actually ask: `health` going red
+    /// is proof it looked, and staying green is proof it did not.
+    pub fn break_graph_source_quietly(&self) {
+        std::fs::write(self.graph_path.with_extension("json.broken"), b"").unwrap();
+    }
+
+    /// Make the graph read fail, as a PipeWire that has stopped answering.
+    pub fn break_graph_source(&self) {
+        std::fs::write(self.graph_path.with_extension("json.broken"), b"").unwrap();
+        self.notify();
+    }
+
+    /// Let it answer again.
+    pub fn mend_graph_source(&self) {
+        let _ = std::fs::remove_file(self.graph_path.with_extension("json.broken"));
+        self.notify();
+    }
+
+    /// The manifest a PEER receives, fetched the way a peer fetches it: over the control port,
+    /// with the real greeting. Asserting on this rather than on the local snapshot is the
+    /// difference between checking a flag and checking the behaviour the flag is supposed to cause.
+    pub fn published_manifest(&self) -> Value {
+        use std::io::{Read, Write};
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            match std::net::TcpStream::connect(("127.0.0.1", self.control_port)) {
+                Ok(mut stream) => {
+                    stream.write_all(b"NXAUDIO/1 MANIFEST\n").unwrap();
+                    stream.shutdown(std::net::Shutdown::Write).ok();
+                    let mut body = String::new();
+                    stream.read_to_string(&mut body).unwrap();
+                    return serde_json::from_str(&body).expect("a peer receives JSON");
+                }
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    sleep(Duration::from_millis(50));
+                }
+                Err(error) => panic!("the control port never answered: {error}"),
+            }
+        }
+    }
+
     pub fn stage(&self, graph: Value) {
         std::fs::write(&self.graph_path, serde_json::to_vec(&graph).unwrap()).unwrap();
         self.notify();
@@ -279,8 +404,8 @@ impl World {
         );
     }
 
-    fn daemon_stderr(&self) -> String {
-        "(streamed to the test harness)".to_owned()
+    pub fn daemon_stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
     }
 
     fn await_bus_name(&self) {
@@ -384,6 +509,7 @@ fn start_bus(root: &Path) -> (Child, String) {
 /// without a network, a second daemon, or a JackTrip.
 pub struct FakePeer {
     pub port: u16,
+    manifest: Value,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -391,11 +517,23 @@ impl FakePeer {
     pub fn serving(manifest: Value) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a fake peer");
         let port = listener.local_addr().unwrap().port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Self::answer(listener, manifest.clone(), stop.clone());
+        Self {
+            port,
+            manifest,
+            stop,
+        }
+    }
+
+    fn answer(
+        listener: TcpListener,
+        manifest: Value,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
         listener
             .set_nonblocking(true)
             .expect("poll rather than block forever on accept");
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
         std::thread::spawn(move || {
             use std::io::{Read, Write};
             const GREETING: usize = "NXAUDIO/1 MANIFEST\n".len();
@@ -417,13 +555,47 @@ impl FakePeer {
                     Err(_) => break,
                 }
             }
+            drop(listener);
         });
-        Self { port, stop }
     }
 
-    /// Stop answering, as a peer whose control endpoint has gone away.
+    /// Stop answering, as a peer whose control endpoint has gone away. Returns once the port is
+    /// actually refusing connections, so a test cannot race the outage it just caused.
     pub fn silence(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let address = format!("127.0.0.1:{}", self.port).parse().unwrap();
+        for _ in 0..400 {
+            if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err() {
+                return;
+            }
+            sleep(Duration::from_millis(10));
+        }
+        panic!("fake peer on {} never stopped answering", self.port);
+    }
+
+    /// Answer again on the SAME port, as the same member coming back. Identity is the port here,
+    /// exactly as it is an address in the real thing: nothing about the peer changed while it was
+    /// away, which is the whole point of the behaviour being tested.
+    pub fn come_back(&self) {
+        self.stop
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Retry rather than expect. The port was ephemeral, so while this peer was away the kernel
+        // was free to hand it to any other test binding :0 -- and the suite runs them in parallel,
+        // which turned a real race into an intermittent panic that looked like a product failure.
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            match TcpListener::bind(("127.0.0.1", self.port)) {
+                Ok(listener) => {
+                    Self::answer(listener, self.manifest.clone(), self.stop.clone());
+                    return;
+                }
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("fake peer could not reclaim port {}: {error}", self.port),
+            }
+        }
     }
 }
 

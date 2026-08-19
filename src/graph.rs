@@ -12,7 +12,7 @@ use std::{
     process::Command,
 };
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Snapshot {
     pub api_version: u32,
     pub revision: u64,
@@ -27,17 +27,37 @@ pub struct Snapshot {
     pub default_input: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Health {
     pub status: String,
     pub message: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Endpoint {
     pub id: String,
     pub device: String,
     pub location: String,
+    /// Whether this endpoint may be ADVERTISED to peers as an output of this machine.
+    ///
+    /// False for a node that is itself a network transport -- a tunnel to another sound server, a
+    /// RAOP speaker. Such a node is perfectly usable from here, and stays selectable locally, but
+    /// telling a peer "this host has an output called X" when X is a pipe back out is untrue, and
+    /// it is the whole of how a circle forms: the peer sends audio for X, our JackTrip delivers it,
+    /// and the pipe forwards it straight back. Measured at 9.35 Mbit/s when the retired Pulse mesh
+    /// was still loaded, on the wire the real audio shares.
+    ///
+    /// Withholding it from the manifest makes the circle unconstructible rather than merely absent:
+    /// a peer cannot route to what it was never told about. Excluding the node ENTIRELY would also
+    /// work and would cost more than it saves -- somebody's AirPlay receiver is a legitimate place
+    /// to send sound, and it cannot loop, because a speaker does not send anything back.
+    ///
+    /// `device.id` is the guard. Anything backed by real hardware is a device whatever else it is
+    /// flagged: a sound card, a USB headset, a BLUETOOTH headset. Bluetooth is a local device
+    /// reached over a radio, not a network transport, and PipeWire does not mark it as one -- the
+    /// guard means it stays exportable even if some future version did.
+    #[serde(default = "exportable_by_default")]
+    pub exportable: bool,
     pub label: String,
     pub available: bool,
     pub volume: f64,
@@ -46,7 +66,7 @@ pub struct Endpoint {
     pub pipewire_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Stream {
     pub id: String,
     pub intent_key: String,
@@ -59,14 +79,14 @@ pub struct Stream {
     pub pipewire_id: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Peer {
     pub name: String,
     pub address: String,
     pub available: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct DeclaredDevice {
     pub id: String,
     pub label: String,
@@ -86,6 +106,11 @@ struct Node {
     media_role: String,
     carrier: Option<String>,
     profile: Option<String>,
+    /// PipeWire's own marker for "this node's audio leaves the machine over a network".
+    network: bool,
+    /// Whether real hardware backs this node. A sound card, a USB headset and a Bluetooth headset
+    /// all have one; a tunnel does not.
+    device_backed: bool,
     volume: f64,
     muted: bool,
 }
@@ -121,6 +146,10 @@ pub struct Graph {
     node_names: HashMap<String, u32>,
 }
 
+fn exportable_by_default() -> bool {
+    true
+}
+
 fn text(props: &Value, key: &str) -> String {
     props
         .get(key)
@@ -139,17 +168,23 @@ fn volume_and_mute(info: &Value) -> (f64, bool) {
         .and_then(|v| v.get("Props"))
         .and_then(Value::as_array)
         .and_then(|v| v.first());
+    // PipeWire stores the level CUBED and PER CHANNEL, and `set_volume` below writes it through
+    // `wpctl set-volume`, which cubes its argument. So the cube root of the first channel is the
+    // only read that is the exact inverse of our own write.
+    //
+    // `Props.volume` is a SEPARATE master knob and sits at 1.0 on every node here, so reading it
+    // first reported 100% for every endpoint on this host while `wpctl` and the mixer both showed
+    // 40%. It stays as the fallback for a node that publishes no per-channel array, never as a
+    // multiplier: multiplying breaks the round trip the moment the master is not unity, and the
+    // slider then fights its own readback.
     let volume = props
-        .and_then(|v| v.get("volume"))
+        .and_then(|v| v.get("channelVolumes"))
+        .and_then(Value::as_array)
+        .and_then(|v| v.first())
         .and_then(Value::as_f64)
-        .or_else(|| {
-            props
-                .and_then(|v| v.get("channelVolumes"))
-                .and_then(Value::as_array)
-                .and_then(|v| v.first())
-                .and_then(Value::as_f64)
-        })
-        .unwrap_or(1.0);
+        .or_else(|| props.and_then(|v| v.get("volume")).and_then(Value::as_f64))
+        .unwrap_or(1.0)
+        .cbrt();
     let muted = props
         .and_then(|v| v.get("mute"))
         .and_then(Value::as_bool)
@@ -219,6 +254,23 @@ impl Graph {
         Self::from_values(&values, config, state, fabric, revision)
     }
 
+    /// A graph for a host whose PipeWire has not answered yet.
+    ///
+    /// Deliberately built from `from_values` with no nodes rather than hand-assembled: every field
+    /// then has the same shape it always has, so nothing downstream needs a special case for it,
+    /// and it cannot drift as the snapshot grows. The health it reports is the honest one -- no
+    /// local devices -- and the caller overrides it with the reason it could not read.
+    pub fn empty(config: &Config, revision: u64) -> Self {
+        Self::from_values(
+            &[],
+            config,
+            &State::default(),
+            &FabricSnapshot::default(),
+            revision,
+        )
+        .expect("an empty graph cannot fail to build")
+    }
+
     pub fn from_values(
         values: &[Value],
         config: &Config,
@@ -275,6 +327,11 @@ impl Graph {
                                 }
                             },
                             media_role: text(props, "media.role"),
+                            network: props
+                                .get("node.network")
+                                .map(|value| value.as_bool() == Some(true) || value == "true")
+                                .unwrap_or(false),
+                            device_backed: props.get("device.id").is_some(),
                             carrier: props
                                 .get("alsa.nixaudio.device")
                                 .and_then(Value::as_str)
@@ -358,6 +415,7 @@ impl Graph {
                 id: id.clone(),
                 device,
                 location: "local".into(),
+                exportable: !node.network || node.device_backed,
                 label,
                 available: true,
                 volume: node.volume,
@@ -422,7 +480,16 @@ impl Graph {
                         .into(),
                     location: peer.clone(),
                     label: format!("{} · {}", peer, manifest.label),
-                    available: target_ports.len() == slice.channels.len(),
+                    // Never re-advertised: this is another host's endpoint, reached through it.
+                    exportable: false,
+                    // BOTH halves, and the conjunction is the point. The port count is a
+                    // media-plane fact about OUR process; `remote.available` is a control-plane
+                    // fact about THEIRS. Ports outlive the peer -- they vanish only when JackTrip
+                    // itself exits, ten seconds after media stops -- so port count alone reports a
+                    // dead destination as usable, which is how every endpoint on this fleet read
+                    // `available: true` while nothing had ever carried a packet.
+                    available: remote.available
+                        && target_ports.len() == slice.channels.len(),
                     volume: 1.0,
                     muted: false,
                     pipewire_id: jacktrip.map(|node| node.id),
@@ -507,8 +574,11 @@ impl Graph {
                         .map(|peer| peer.address.clone())
                         .or_else(|| configured.addresses.first().cloned())
                         .unwrap_or_default(),
+                    // "Can sound go there right now" -- the peer answers AND we hold a session
+                    // for it. Either half alone is a half-truth a user would act on.
                     available: current.is_some_and(|peer| {
-                        nodes.values().any(|node| node.name == peer.plan.node_name)
+                        peer.available
+                            && nodes.values().any(|node| node.name == peer.plan.node_name)
                     }),
                 }
             })
@@ -538,17 +608,16 @@ impl Graph {
             })
             .collect();
         unavailable_devices.sort_by(|a, b| a.id.cmp(&b.id));
-        let missing = config
-            .catalogue
-            .iter()
-            .filter(|(_, entry)| entry.origin == "local")
-            .filter(|(key, _)| {
-                !outputs
-                    .iter()
-                    .chain(inputs.iter())
-                    .any(|endpoint| endpoint.location == "local" && &endpoint.device == *key)
-            })
-            .count();
+        // A DECLARED LOCAL DEVICE THAT IS NOT PLUGGED IN HERE IS NOT A FAULT, and counting it as one
+        // is why this signal was useless. A device declaration is a naming rule: it says "if this
+        // hardware appears, call it `hyperx`". The same declaration is deliberately made on every
+        // host the hardware can roam to, because the name has to follow the device. So a headset
+        // sitting in one machine's USB port left the other two permanently degraded, over hardware
+        // they could play into perfectly well through their peers -- a status that is always red
+        // says exactly as little as one that is always green.
+        //
+        // The absence is still published, in `unavailable_devices`, where a UI can show it as what
+        // it is: something declared that is not here. Health does not have to claim it is wrong.
         let unavailable_peers = peers.iter().filter(|peer| !peer.available).count();
         let health =
             if outputs.iter().all(|endpoint| endpoint.location != "local") && inputs.is_empty() {
@@ -556,13 +625,10 @@ impl Graph {
                     status: "error".into(),
                     message: "PipeWire has no local audio devices".into(),
                 }
-            } else if missing > 0 || unavailable_peers > 0 {
+            } else if unavailable_peers > 0 {
                 Health {
                     status: "degraded".into(),
-                    message: format!(
-                        "{} declared local device(s) and {} peer(s) unavailable",
-                        missing, unavailable_peers
-                    ),
+                    message: format!("{unavailable_peers} peer(s) cannot carry audio"),
                 }
             } else {
                 Health {
@@ -667,7 +733,7 @@ impl Graph {
         ] {
             for endpoint in endpoints
                 .iter()
-                .filter(|endpoint| endpoint.location == "local")
+                .filter(|endpoint| endpoint.location == "local" && endpoint.exportable)
             {
                 let mut endpoint_ports: Vec<&Port> = self
                     .endpoint_ports
@@ -737,6 +803,54 @@ impl Graph {
             .get(stream)
             .map(String::as_str)
             .ok_or_else(|| anyhow!("unknown stream {stream}"))
+    }
+
+    /// Turn remembered intent into the destinations sound can actually reach right now.
+    ///
+    /// This is the whole of route fallback and route reclaim, and it is deliberately one function
+    /// with no state of its own. Intent lives in `state.json` and is never rewritten here: the
+    /// moment a fallback is written down it BECOMES the intent, and the route can never come back.
+    ///
+    /// Partial credit is on purpose. A stream pinned to two destinations with one of them away
+    /// keeps the survivor and does not also gain the default, which would double-route it.
+    /// Everything terminates: the default output has already been filtered to something available
+    /// and local, so the recursion is one step deep by construction.
+    pub fn resolve(&self, wanted: &[String]) -> Vec<String> {
+        let live: Vec<String> = wanted
+            .iter()
+            .filter(|id| self.is_usable(id))
+            .cloned()
+            .collect();
+        if !live.is_empty() {
+            return live;
+        }
+        // Losing a peer must never mean losing the sound. Somewhere audible here is the answer.
+        self.snapshot.default_output.clone().into_iter().collect()
+    }
+
+    /// Whether an endpoint can carry audio at this instant. One definition, so a route, a default
+    /// and the tray cannot disagree about what "available" means.
+    pub fn is_usable(&self, endpoint: &str) -> bool {
+        self.snapshot
+            .outputs
+            .iter()
+            .any(|candidate| candidate.id == endpoint && candidate.available)
+            && self
+                .endpoint_ports
+                .get(endpoint)
+                .is_some_and(|ports| !ports.is_empty())
+    }
+
+    /// Whether this id names something the user is ALLOWED to pin to -- a local endpoint that
+    /// exists, or any endpoint on a configured peer. Deliberately weaker than `is_usable`: pinning
+    /// to a peer that is currently asleep has to be legal, or intent could never outlive an outage.
+    pub fn is_addressable(&self, config: &Config, endpoint: &str) -> bool {
+        if self.endpoint_ports.contains_key(endpoint) {
+            return true;
+        }
+        endpoint
+            .split_once('.')
+            .is_some_and(|(location, _)| config.peers.contains_key(location))
     }
 
     pub fn has_endpoint(&self, endpoint: &str) -> bool {
@@ -973,6 +1087,7 @@ mod tests {
                 addresses: vec!["beta.local".into()],
                 control_port: 45900,
                 audio_port: 46001,
+                transport: crate::config::PeerTransport::default(),
             },
         );
         let manifest = Manifest {
@@ -1008,6 +1123,8 @@ mod tests {
                     address: "beta.local".into(),
                     manifest,
                     plan,
+                    available: true,
+                    misses: 0,
                 },
             )]),
         };
