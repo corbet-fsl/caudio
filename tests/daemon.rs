@@ -122,8 +122,6 @@ fn a_pinned_route_is_restored_when_the_graph_changes_underneath_it() {
     );
 }
 
-/// Level control is a local concern by design: nixaudio moves audio, it does not mix. A remote
-/// endpoint must refuse rather than silently do nothing.
 #[test]
 fn setting_a_local_default_reaches_wpctl() {
     let world = World::local(one_sink_and_firefox("A useful tab"));
@@ -767,4 +765,257 @@ fn a_client_appearing_is_not_a_graph_change_but_a_node_is() {
     world.until("the poisoned read to be noticed", |s| {
         s["health"]["status"] == "error"
     });
+}
+
+/// A level we do not have is reported as absent, never as a number.
+///
+/// `fabric::EndpointManifest` carries id, label and channels — and nothing about level or mute. So
+/// a peer's speakers have no reading here, and the daemon refuses to set one. It used to publish
+/// `1.0`/unmuted for every remote endpoint, which a tray tooltip rendered as "100%": a confident
+/// statement about a device that might have been muted. Absence beats a guess.
+#[test]
+fn a_remote_endpoint_publishes_no_level_rather_than_a_convincing_one() {
+    let peer = FakePeer::serving(manifest("beta", &[("local.hyperx", &["FL", "FR"])]));
+    let world = World::with_peers(
+        one_sink_and_firefox("A useful tab"),
+        json!({ "beta": { "addresses": ["127.0.0.1"], "controlPort": peer.port, "audioPort": 46001 } }),
+    );
+
+    let mut graph = one_sink_and_firefox("A useful tab");
+    graph
+        .as_array_mut()
+        .unwrap()
+        .extend(support::jacktrip_session(50, 500, "beta", 2, 2));
+    world.stage(graph);
+
+    let snapshot = world.until("beta's endpoint to appear", |s| {
+        s["outputs"]
+            .as_array()
+            .is_some_and(|o| o.iter().any(|e| e["id"] == "beta.hyperx"))
+    });
+
+    let outputs = snapshot["outputs"].as_array().expect("outputs");
+    let remote = outputs
+        .iter()
+        .find(|e| e["id"] == "beta.hyperx")
+        .expect("beta.hyperx");
+    assert!(
+        remote["volume"].is_null() && remote["muted"].is_null(),
+        "a remote endpoint must publish no level at all, got volume={} muted={}",
+        remote["volume"],
+        remote["muted"]
+    );
+
+    // And the local one still does, so this is not "the field stopped working".
+    let local = outputs
+        .iter()
+        .find(|e| e["id"] == "local.hyperx.analog-stereo")
+        .expect("the local sink");
+    assert!(
+        local["volume"].is_number() && local["muted"].is_boolean(),
+        "a local endpoint still reports a real level, got volume={} muted={}",
+        local["volume"],
+        local["muted"]
+    );
+}
+
+/// Level control is a local concern by design: nixaudio moves audio, it does not mix. A remote
+/// endpoint must REFUSE rather than silently do nothing.
+///
+/// That sentence sat above `setting_a_local_default_reaches_wpctl` for a long time, which sets a
+/// default on a LOCAL endpoint and never touches a remote level — a rule written down as spec and
+/// enforced by nothing. It is also worth pinning because the refusal is currently an accident
+/// rather than a decision: `set_volume` resolves through `endpoint_nodes`, and that map is only
+/// ever written in the local branch of `Graph::from_values`, so a remote id simply misses. Should
+/// anyone one day populate it for remote endpoints, the refusal disappears silently and `wpctl`
+/// gets pointed at a node id that means nothing on this machine.
+#[test]
+fn a_remote_endpoint_refuses_a_level_change_rather_than_pretending() {
+    let peer = FakePeer::serving(manifest("beta", &[("local.hyperx", &["FL", "FR"])]));
+    let world = World::with_peers(
+        one_sink_and_firefox("A useful tab"),
+        json!({ "beta": { "addresses": ["127.0.0.1"], "controlPort": peer.port, "audioPort": 46001 } }),
+    );
+
+    let mut graph = one_sink_and_firefox("A useful tab");
+    graph
+        .as_array_mut()
+        .unwrap()
+        .extend(support::jacktrip_session(50, 500, "beta", 2, 2));
+    world.stage(graph);
+    world.until("beta's endpoint to appear", |s| {
+        s["outputs"]
+            .as_array()
+            .is_some_and(|o| o.iter().any(|e| e["id"] == "beta.hyperx"))
+    });
+
+    let volume = world.ctl(&["volume", "beta.hyperx", "0.5"]);
+    assert!(
+        volume.is_err(),
+        "setting a level on a peer's speakers must fail, got {volume:?}"
+    );
+    let mute = world.ctl(&["mute", "beta.hyperx", "on"]);
+    assert!(
+        mute.is_err(),
+        "muting a peer's speakers must fail, got {mute:?}"
+    );
+
+    // The same two calls against a LOCAL endpoint still work, so this pins a refusal rather than a
+    // broken command.
+    world
+        .ctl(&["volume", "local.hyperx.analog-stereo", "0.5"])
+        .expect("a local level still sets");
+    world
+        .ctl(&["mute", "local.hyperx.analog-stereo", "on"])
+        .expect("a local mute still sets");
+}
+
+/// A stream nobody asked us about belongs to PipeWire, and stays where PipeWire put it.
+///
+/// BEHAVIORS: "PipeWire owns each host's local graph. Devices, streams, ports, mixing and local
+/// policy are its job. nixaudio never becomes a second media graph." A local default is applied
+/// with `wpctl set-default`, so PipeWire already places new streams there; re-asserting it every
+/// pass added nothing and took away the ability to move a stream at all. Measured on corbet-server
+/// before this: a stream moved by hand onto another sink was dragged back within five seconds,
+/// repeatedly, which made nixaudio fight pavucontrol, wpctl and the desktop's own settings.
+#[test]
+fn a_stream_we_were_never_asked_about_is_left_where_someone_else_put_it() {
+    // Two local sinks. The stream is already linked to the SECOND one, as though a person had just
+    // moved it there, while the default output is the first.
+    let mut graph = json!([
+        sink(10, 100, "alsa_output.usb-hyperx", "hyperx", "analog-stereo"),
+        port(11, 10, "playback_FL", "in", "FL"),
+        port(12, 10, "playback_FR", "in", "FR"),
+        sink(30, 300, "alsa_output.usb-shure", "shure", "analog-stereo"),
+        port(31, 30, "playback_FL", "in", "FL"),
+        port(32, 30, "playback_FR", "in", "FR"),
+        stream(20, 200, "Firefox", "A useful tab", "Music"),
+        port(21, 20, "output_FL", "out", "FL"),
+        port(22, 20, "output_FR", "out", "FR"),
+    ]);
+    graph
+        .as_array_mut()
+        .unwrap()
+        .extend([link(40, 20, 21, 30, 31), link(41, 20, 22, 30, 32)]);
+
+    let world = World::local(graph);
+    world
+        .ctl(&["default-output", "local.hyperx.analog-stereo"])
+        .expect("set the default to the OTHER sink");
+
+    // Long enough for many reconcile passes to have run.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let calls = world.calls();
+    let relinked: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.starts_with("pw-link ") && !c.starts_with("pw-link -d"))
+        .collect();
+    assert!(
+        relinked.is_empty(),
+        "an unpinned stream must not be dragged onto the default; nixaudio issued {relinked:?}"
+    );
+}
+
+/// ...but a REMOTE default is the one case where this loop is not redundant, it is the whole
+/// implementation. There is deliberately no fake local sink for `wpctl` to select, so a peer's
+/// speakers can only be reached by linking each unpinned stream to its JackTrip slice. Without
+/// this half, the fix above would silently delete the feature.
+#[test]
+fn an_unpinned_stream_still_follows_a_remote_default_because_pipewire_cannot() {
+    let peer = FakePeer::serving(manifest("beta", &[("local.hyperx", &["FL", "FR"])]));
+    let world = World::with_peers(
+        one_sink_and_firefox("A useful tab"),
+        json!({ "beta": { "addresses": ["127.0.0.1"], "controlPort": peer.port, "audioPort": 46001 } }),
+    );
+
+    let mut graph = one_sink_and_firefox("A useful tab");
+    graph
+        .as_array_mut()
+        .unwrap()
+        .extend(support::jacktrip_session(50, 500, "beta", 2, 2));
+    world.stage(graph);
+    world.until("beta to be usable", |s| {
+        s["outputs"].as_array().is_some_and(|o| {
+            o.iter()
+                .any(|e| e["id"] == "beta.hyperx" && e["available"] == true)
+        })
+    });
+
+    world
+        .ctl(&["default-output", "beta.hyperx"])
+        .expect("make the peer's speakers the default");
+
+    world.until_calls("the unpinned stream to be linked across the fabric", |calls| {
+        calls.iter().any(|c| c == "pw-link 21 51")
+    });
+}
+
+/// Two streams that look identical must not make the snapshot reorder itself.
+///
+/// `refresh` publishes a revision only when the snapshot actually differs, so an unstable sort is
+/// indistinguishable from a real change: two browser tabs with no `media.name` compare equal on
+/// application and title, their order fell out of a HashMap traversal, and the daemon would wake
+/// every client at roughly half the reconcile rate for ever with nothing to show. That is the same
+/// pathology as the pw-dump self-wake, arriving by a different door.
+#[test]
+fn two_indistinguishable_streams_do_not_make_the_snapshot_flap() {
+    let world = World::local(json!([
+        sink(10, 100, "alsa_output.usb-hyperx", "hyperx", "analog-stereo"),
+        port(11, 10, "playback_FL", "in", "FL"),
+        port(12, 10, "playback_FR", "in", "FR"),
+        // Same application, same (absent) title. Only the ids differ.
+        stream(20, 200, "Firefox", "", "Music"),
+        port(21, 20, "output_FL", "out", "FL"),
+        stream(40, 400, "Firefox", "", "Music"),
+        port(41, 40, "output_FL", "out", "FL"),
+    ]));
+
+    world.until("both streams to be read", |s| {
+        s["streams"].as_array().is_some_and(|v| v.len() == 2)
+    });
+
+    let before = world.inspect()["revision"].as_u64().expect("a revision");
+    for _ in 0..8 {
+        world.notify();
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    let after = world.inspect()["revision"].as_u64().expect("a revision");
+
+    assert_eq!(
+        before, after,
+        "eight passes over two identical-looking streams must produce no news"
+    );
+}
+
+/// When one naming rule matches two devices, which one keeps the plain id must not be a coin flip.
+///
+/// The loop hands the bare id to whichever node it meets first and a `.{serial}` suffix to the
+/// next. Iterating a HashMap made that a per-restart lottery, so a route persisted against
+/// `local.hyperx.analog-stereo` could come back bound to the other headset. Ordering by PipeWire's
+/// own creation order makes the older device keep the plain name, every time.
+#[test]
+fn the_older_of_two_matching_devices_keeps_the_plain_name() {
+    // Same vendor/product identity, so `endpoint_identity` yields the same base id for both.
+    let world = World::local(json!([
+        sink(30, 900, "alsa_output.usb-hyperx", "hyperx", "analog-stereo"),
+        port(31, 30, "playback_FL", "in", "FL"),
+        sink(10, 100, "alsa_output.usb-hyperx", "hyperx", "analog-stereo"),
+        port(11, 10, "playback_FL", "in", "FL"),
+    ]));
+
+    let snapshot = world.until("both sinks to be read", |s| {
+        s["outputs"].as_array().is_some_and(|v| v.len() == 2)
+    });
+    let outputs = snapshot["outputs"].as_array().expect("outputs");
+
+    let plain = outputs
+        .iter()
+        .find(|e| e["id"] == "local.hyperx.analog-stereo")
+        .expect("one endpoint keeps the plain id");
+    assert_eq!(
+        plain["pipewire_id"], 10,
+        "the plain id must belong to the LOWER serial (900 vs 100), not to whichever the map \
+         happened to yield first"
+    );
 }
