@@ -2,7 +2,7 @@
 name = "nixaudio"
 version = "0.2.0"
 edition = "2021"
-license = "MIT"
+license = "FSL-1.1-ALv2"
 description = "Semantic PipeWire control plane for local and network audio devices"
 
 [dependencies]

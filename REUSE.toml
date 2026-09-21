@@ -1,0 +1,20 @@
+version = 1
+
+[[annotations]]
+path = [
+  "Cargo.lock",
+  "Cargo.toml",
+  "LICENSE.md",
+  "README.md",
+  "REUSE.toml",
+  ".gitignore",
+  "src/**",
+  "tests/**",
+]
+SPDX-FileCopyrightText = "2026 Julian Y. Richard Corbet"
+SPDX-License-Identifier = "FSL-1.1-ALv2"
+
+[[annotations]]
+path = "LICENSES/FSL-1.1-ALv2.txt"
+SPDX-FileCopyrightText = "2026 Julian Y. Richard Corbet"
+SPDX-License-Identifier = "FSL-1.1-ALv2"
