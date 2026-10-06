@@ -450,7 +450,10 @@ mod tests {
                 serde_json::from_str::<Queue>(&format!("\"{text}\"")).unwrap(),
                 queue
             );
-            assert_eq!(serde_json::to_string(&queue).unwrap(), format!("\"{text}\""));
+            assert_eq!(
+                serde_json::to_string(&queue).unwrap(),
+                format!("\"{text}\"")
+            );
         }
         assert!("auto-3".parse::<Queue>().is_err());
         assert!("sometimes".parse::<Queue>().is_err());

@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "generator": "ccid render v1",
+  "tool_revision": "77a5ac18542750de020ebf753d22c3200530282b",
+  "manifest_sha256": "9b8964dc6443f1b96c6c40ce3face9915d52acfba3a404fa3036f62bc9bb8397",
+  "jobs": {
+    "verify": {
+      "job": "verify",
+      "scheduler": "crow",
+      "checks": [
+        "rust"
+      ],
+      "workflow": "repository-jobs",
+      "command": [
+        "bash",
+        ".ci/run-job.sh"
+      ]
+    }
+  }
+}

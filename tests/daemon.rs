@@ -348,9 +348,11 @@ fn a_pinned_route_falls_back_and_reclaims_while_the_jacktrip_node_never_moves() 
         .extend(support::jacktrip_session(50, 500, "beta", 2, 2));
     world.stage(graph);
     world.until("beta to be usable", |snapshot| {
-        snapshot["outputs"]
-            .as_array()
-            .is_some_and(|outputs| outputs.iter().any(|o| o["id"] == "beta.hyperx" && o["available"] == true))
+        snapshot["outputs"].as_array().is_some_and(|outputs| {
+            outputs
+                .iter()
+                .any(|o| o["id"] == "beta.hyperx" && o["available"] == true)
+        })
     });
 
     world
@@ -371,11 +373,14 @@ fn a_pinned_route_falls_back_and_reclaims_while_the_jacktrip_node_never_moves() 
     // Wait for BOTH channels. `apply_route` links them as two separate `pw-link` invocations, so a
     // predicate satisfied by the first one races the second and fails intermittently on the
     // assertion below -- which is a test that reports a product failure it did not observe.
-    world.until_calls("the sound to fall back to somewhere audible here", |calls| {
-        let since = &calls[before_outage..];
-        since.iter().any(|call| call == "pw-link 21 11")
-            && since.iter().any(|call| call == "pw-link 22 12")
-    });
+    world.until_calls(
+        "the sound to fall back to somewhere audible here",
+        |calls| {
+            let since = &calls[before_outage..];
+            since.iter().any(|call| call == "pw-link 21 11")
+                && since.iter().any(|call| call == "pw-link 22 12")
+        },
+    );
     assert_eq!(
         world.persisted_state().unwrap()["routes"]["firefox|Music"],
         json!(["beta.hyperx"]),
@@ -581,7 +586,8 @@ fn a_daemon_that_cannot_read_the_graph_at_startup_starts_anyway_and_recovers() {
         blind["health"]["message"]
     );
     assert_eq!(
-        blind["outputs"], json!([]),
+        blind["outputs"],
+        json!([]),
         "and it claims no devices, which is true, rather than inventing any"
     );
 
@@ -682,7 +688,6 @@ fn a_network_pipe_is_usable_here_but_never_advertised_to_a_peer() {
         "and it must still be told about the Bluetooth headset: {advertised:?}"
     );
 }
-
 
 /// PipeWire stores a level CUBED, and in a per-channel array. `wpctl set-volume` cubes its
 /// argument on the way in, so anything that reads the level back without taking the cube root is
@@ -966,9 +971,10 @@ fn an_unpinned_stream_still_follows_a_remote_default_because_pipewire_cannot() {
         .ctl(&["default-output", "beta.hyperx"])
         .expect("make the peer's speakers the default");
 
-    world.until_calls("the unpinned stream to be linked across the fabric", |calls| {
-        calls.iter().any(|c| c == "pw-link 21 51")
-    });
+    world.until_calls(
+        "the unpinned stream to be linked across the fabric",
+        |calls| calls.iter().any(|c| c == "pw-link 21 51"),
+    );
 }
 
 /// Two streams that look identical must not make the snapshot reorder itself.

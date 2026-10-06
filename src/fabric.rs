@@ -297,7 +297,11 @@ fn arguments(plan: &SessionPlan, transport: &ResolvedTransport) -> Vec<String> {
     args
 }
 
-fn worker_spec(plan: &SessionPlan, command: &[String], transport: &ResolvedTransport) -> WorkerSpec {
+fn worker_spec(
+    plan: &SessionPlan,
+    command: &[String],
+    transport: &ResolvedTransport,
+) -> WorkerSpec {
     WorkerSpec {
         command: command.to_vec(),
         arguments: arguments(plan, transport),
@@ -391,7 +395,8 @@ impl Runtime {
             }
         }
         self.peers.retain(|name, _| config.peers.contains_key(name));
-        self.unseen.retain(|name, _| config.peers.contains_key(name));
+        self.unseen
+            .retain(|name, _| config.peers.contains_key(name));
         self.spawn_backoff
             .retain(|name, _| config.peers.contains_key(name));
 
@@ -611,8 +616,8 @@ pub async fn serve(config: Config, manifest: Arc<RwLock<Manifest>>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{PeerTransport, TransportConfig};
     use crate::config::ControlConfig;
+    use crate::config::{PeerTransport, TransportConfig};
 
     fn endpoint(id: &str, channels: &[&str]) -> EndpointManifest {
         EndpointManifest {

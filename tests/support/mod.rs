@@ -600,8 +600,7 @@ impl FakePeer {
     /// exactly as it is an address in the real thing: nothing about the peer changed while it was
     /// away, which is the whole point of the behaviour being tested.
     pub fn come_back(&self) {
-        self.stop
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(false, std::sync::atomic::Ordering::Relaxed);
         // Retry rather than expect. The port was ephemeral, so while this peer was away the kernel
         // was free to hand it to any other test binding :0 -- and the suite runs them in parallel,
         // which turned a real race into an intermittent panic that looked like a product failure.

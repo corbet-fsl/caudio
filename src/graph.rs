@@ -503,8 +503,7 @@ impl Graph {
                     // itself exits, ten seconds after media stops -- so port count alone reports a
                     // dead destination as usable, which is how every endpoint on this fleet read
                     // `available: true` while nothing had ever carried a packet.
-                    available: remote.available
-                        && target_ports.len() == slice.channels.len(),
+                    available: remote.available && target_ports.len() == slice.channels.len(),
                     // Not "unity" -- unknown. See Endpoint::volume.
                     volume: None,
                     muted: None,
